@@ -1,6 +1,17 @@
 // 结构自检：不连服务、不开浏览器，只验证插件出厂形态正确。
 import createPlugin from "../dist/local-asr.js";
 
+function makeFakeReact() {
+    return {
+        createElement: (type, props, ...children) => ({ type, props: props || {}, children }),
+        useState: (v) => [v, () => {}],
+        useEffect: () => {},
+        useRef: (v) => ({ current: v }),
+        useMemo: (fn) => fn(),
+        useCallback: (fn) => fn,
+    };
+}
+
 const checks = [];
 function check(name, fn) {
     try {
@@ -11,81 +22,81 @@ function check(name, fn) {
     }
 }
 
-const runtime = { React: makeFakeReact() };
+const plugin = createPlugin({ React: makeFakeReact() });
+const nodes = plugin.nodes || [];
 
-function makeFakeReact() {
-    const createElement = (type, props, ...children) => ({ type, props: props || {}, children });
-    const hooks = [];
-    return {
-        createElement,
-        useState: (v) => [v, () => {}],
-        useEffect: () => {},
-        useRef: (v) => ({ current: v }),
-        useMemo: (fn) => fn(),
-        __hooks: hooks,
-    };
-}
-
-const plugin = createPlugin(runtime);
-
-check("插件 id", () => {
-    if (plugin.id !== "local-asr") throw new Error("id 不对：" + plugin.id);
+check("插件 id 是 local-tts", () => {
+    if (plugin.id !== "local-tts") throw new Error("id=" + plugin.id);
 });
-check("有 name/version/minAppVersion", () => {
+check("有 name/version/minAppVersion/description", () => {
     for (const k of ["name", "version", "minAppVersion", "description"]) {
         if (!plugin[k]) throw new Error("缺 " + k);
     }
 });
-check("nodes 是数组且非空", () => {
-    if (!Array.isArray(plugin.nodes) || plugin.nodes.length === 0) throw new Error("nodes 空");
+check("六个页签都在（配置 + 转写 + 5 个语音）", () => {
+    const want = ["settings", "asr", "clone", "design", "direction", "multi", "srt"];
+    const got = nodes.map((n) => n.type.split(":")[1]);
+    for (const w of want) {
+        if (!got.includes(w)) throw new Error("缺节点：" + w + "（现有 " + got.join(",") + "）");
+    }
+    if (nodes.length !== want.length) throw new Error("节点数 " + nodes.length + " 应为 " + want.length);
 });
-check("节点类型带命名空间", () => {
-    if (!/^local-asr:/.test(plugin.nodes[0].type)) throw new Error("type=" + plugin.nodes[0].type);
+check("节点类型都带 local-tts: 前缀", () => {
+    for (const n of nodes) {
+        if (!/^local-tts:/.test(n.type)) throw new Error("type=" + n.type);
+    }
 });
-check("节点有 title/icon", () => {
-    const n = plugin.nodes[0];
-    if (!n.title || !n.icon) throw new Error("缺 title/icon");
+check("每个节点有 title/icon/description", () => {
+    for (const n of nodes) {
+        if (!n.title || !n.icon || !n.description) throw new Error("节点 " + n.type + " 缺字段");
+    }
 });
-check("defaultSize 数值完整", () => {
-    const s = plugin.nodes[0].defaultSize || {};
-    if (typeof s.width !== "number" || typeof s.height !== "number") throw new Error("defaultSize 不完整");
+check("defaultSize 都是数字", () => {
+    for (const n of nodes) {
+        const s = n.defaultSize || {};
+        if (typeof s.width !== "number" || typeof s.height !== "number") throw new Error(n.type + " defaultSize 不完整");
+    }
 });
-check("hasSourceHandle 为 true", () => {
-    if (plugin.nodes[0].hasSourceHandle !== true) throw new Error("hasSourceHandle 应为 true");
-});
-check("Content 是函数", () => {
-    if (typeof plugin.nodes[0].Content !== "function") throw new Error("Content 不是函数");
-});
-check("defaultMetadata 有 bridgeUrl", () => {
-    const m = plugin.nodes[0].defaultMetadata || {};
-    if (!/^http:\/\/127\.0\.0\.1:9001/.test(m.bridgeUrl)) throw new Error("bridgeUrl=" + m.bridgeUrl);
+check("defaultMetadata 都指向 9001 桥", () => {
+    for (const n of nodes) {
+        const m = n.defaultMetadata || {};
+        if (!/^http:\/\/127\.0\.0\.1:9001/.test(m.bridgeUrl)) throw new Error(n.type + " bridgeUrl=" + m.bridgeUrl);
+    }
 });
 check("出厂不带密钥", () => {
-    const dump = JSON.stringify(plugin.nodes[0].defaultMetadata || {});
-    if (/sk-|apiKey/i.test(dump)) throw new Error("默认元数据里有疑似密钥");
+    for (const n of nodes) {
+        const dump = JSON.stringify(n.defaultMetadata || {});
+        if (/sk-|apiKey/i.test(dump)) throw new Error(n.type + " 默认元数据里有疑似密钥");
+    }
 });
-check("Content 渲染不抛错", () => {
-    const node = {
-        id: "n1",
-        title: "音频",
-        width: 380,
-        height: 500,
-        position: { x: 0, y: 0 },
-        metadata: { ...plugin.nodes[0].defaultMetadata },
-    };
-    const ctx = {
-        node,
-        theme: { node: { text: "#eee", muted: "#999", stroke: "#ffffff33" } },
-        getUpstream: () => [],
-        updateMetadata: () => {},
-        applyOps: () => {},
-    };
-    const tree = plugin.nodes[0].Content({ ctx });
-    if (!tree || typeof tree !== "object") throw new Error("Content 没返回元素");
+check("每个节点 Content 是函数且能渲染", () => {
+    for (const n of nodes) {
+        if (typeof n.Content !== "function") throw new Error(n.type + " Content 不是函数");
+        const ctx = {
+            node: {
+                id: "n1", title: "测试节点", width: 380, height: 520,
+                position: { x: 0, y: 0 },
+                metadata: { ...(n.defaultMetadata || {}) },
+            },
+            theme: { node: { text: "#eee", muted: "#999", stroke: "#ffffff33" } },
+            getUpstream: () => [],
+            updateMetadata: () => {},
+            applyOps: () => {},
+        };
+        const tree = n.Content({ ctx });
+        if (!tree || typeof tree !== "object") throw new Error(n.type + " Content 没返回元素");
+    }
 });
-check("面板文案不含英文报错原串", () => {
-    const n = plugin.nodes[0];
-    if (/undefined|NaN/.test(`${n.title}${n.description}`)) throw new Error("文案里有 undefined/NaN");
+check("只有配置节点没有出线", () => {
+    for (const n of nodes) {
+        if (n.type === "local-tts:settings" && n.hasSourceHandle !== false) throw new Error("配置节点不该 hasSourceHandle");
+        if (n.type !== "local-tts:settings" && n.hasSourceHandle !== true) throw new Error(n.type + " 应 hasSourceHandle");
+    }
+});
+check("面板文案没有 undefined/NaN", () => {
+    for (const n of nodes) {
+        if (/undefined|NaN/.test(`${n.title}${n.description}`)) throw new Error(n.type + " 文案里有 undefined/NaN");
+    }
 });
 
 let failed = 0;

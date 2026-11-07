@@ -1,16 +1,22 @@
 // Breeze-TTS 本地桥：把本地 Gradio 服务包装成「允许跨域」的简单接口给无限画布用。
 //
-// 为什么需要它（这三条都是实测结论，不是猜的）：
+// 为什么需要它（三条实测结论）：
 // 1. Gradio 的 /gradio_api/call/* 预检通过了，但响应里不带 Access-Control-Allow-Origin，
-//    所以从 https 的画布页面直接 fetch 会被浏览器按 CORS 拦掉。
-// 2. Gradio 的真实调用是三段式：先 /gradio_api/upload 上传文件拿到临时路径，
+//    从 https 的画布页面直接 fetch 会被浏览器按 CORS 拦掉。
+// 2. Gradio 的真实调用是三段式：先 /gradio_api/upload 上传文件拿临时路径，
 //    再 POST /gradio_api/call/<api> 换 event_id，最后 GET .../<event_id> 读 SSE。
-//    这一步画布页面自己拼很容易出错，放在桥里做一次就够了。
-// 3. 桥自己会回 Access-Control-Allow-Origin（还能回 Private-Network 头），
-//    所以画布页面只要连桥就行，不用碰 Gradio。
+// 3. 桥自己回 CORS 头，画布页面只连桥，不碰 Gradio 的细节。
 //
 // 用法：node bridge/breeze_bridge.mjs
 // 环境变量：BREEZE_BASE（默认 http://127.0.0.1:9000）、BRIDGE_PORT（默认 9001）
+//
+// 接口：
+//   GET  /health              探活，回 Gradio 端点数 / 音色数
+//   GET  /voices              音色列表（voices 目录）
+//   POST /asr                 {audioBase64, filename, mime} → 文本
+//   POST /tts                 {mode: design|clone|direction, ...} → 音频
+//   POST /multi               {script, roles[], voices[], speeds[], seed} → 音频
+//   POST /srt                 {srtBase64, srtName, voice, seed} → 音频
 
 import http from "node:http";
 import fs from "node:fs/promises";
@@ -43,13 +49,13 @@ async function readBody(req) {
 function parseSSE(raw) {
     let armed = false;
     let payload = null;
-    let lastError = null;
+    let sawError = false;
     for (const line of raw.split(/\r?\n/)) {
         const s = line.trim();
         if (s.startsWith("event:")) {
             const name = s.slice(6).trim();
             armed = name === "complete";
-            if (name === "error") lastError = true;
+            if (name === "error") sawError = true;
             continue;
         }
         if (armed && s.startsWith("data:")) {
@@ -57,7 +63,9 @@ function parseSSE(raw) {
             armed = false;
         }
     }
-    if (payload === null) return { ok: false, error: lastError ? "Gradio 返回 error 事件" : "没有收到 complete 事件" };
+    if (payload === null) {
+        return { ok: false, error: sawError ? "Gradio 返回 error 事件（多半是参数不对或文件读不到）" : "没有收到 complete 事件" };
+    }
     try {
         return { ok: true, data: JSON.parse(payload) };
     } catch {
@@ -65,7 +73,6 @@ function parseSSE(raw) {
     }
 }
 
-/** 上传一个 Blob 到 Gradio，拿回服务端临时路径 */
 async function uploadToGradio(blob, filename) {
     const form = new FormData();
     form.append("files", blob, filename);
@@ -80,7 +87,6 @@ async function uploadToGradio(blob, filename) {
     return paths[0];
 }
 
-/** 三段式调用一个 Gradio 端点，返回 complete 的 data 数组 */
 async function callGradio(api, data, timeoutMs = 600000) {
     const started = Date.now();
     const response = await fetch(`${GRADIO}/gradio_api/call/${api}`, {
@@ -99,11 +105,7 @@ async function callGradio(api, data, timeoutMs = 600000) {
     if (!sse.ok) throw new Error(`读取结果 HTTP ${sse.status}`);
     const raw = await sse.text();
     const parsed = parseSSE(raw);
-    if (!parsed.ok) {
-        // 有时 Gradio 会在 data 里塞 {"error": ...}
-        const m = /"error"\s*:\s*["{]?([^"}]*)/.exec(raw);
-        throw new Error(parsed.error + (m ? `（${m[1]}）` : ""));
-    }
+    if (!parsed.ok) throw new Error(parsed.error);
     return { data: parsed.data, ms: Date.now() - started };
 }
 
@@ -111,19 +113,27 @@ function toFileData(path, filename) {
     return { path, orig_name: filename, meta: { _type: "gradio.FileData" } };
 }
 
-/** 从 Gradio 返回的 Audio 值里取出音频字节 */
+function safeName(name, fallback) {
+    return String(name || fallback).replace(/[\\/:*?"<>|]/g, "_");
+}
+
+async function uploadBase64(base64, filename, mime) {
+    const raw = Buffer.from(String(base64), "base64");
+    if (!raw.length) throw new Error("上传的文件解码后是空的");
+    const name = safeName(filename, "upload.bin");
+    const path = await uploadToGradio(new Blob([raw], { type: mime || "application/octet-stream" }), name);
+    return { path, name, bytes: raw.length };
+}
+
 async function audioToBuffer(value) {
     if (!value) throw new Error("Gradio 没有返回音频");
     let path = "";
     if (typeof value === "string") path = value;
     else if (typeof value === "object") path = value.path || value.name || "";
     if (!path) throw new Error("返回结构里找不到音频路径：" + JSON.stringify(value).slice(0, 200));
-
     try {
-        const buf = await fs.readFile(path);
-        return { buffer: buf, path };
+        return { buffer: await fs.readFile(path), path };
     } catch {
-        // 路径读不到就退回 url 下载
         const url = typeof value === "object" ? value.url : "";
         if (!url) throw new Error("音频文件读不到，也没有可下载的 url");
         const response = await fetch(url, { signal: AbortSignal.timeout(120000) });
@@ -132,12 +142,28 @@ async function audioToBuffer(value) {
     }
 }
 
+async function finishAudio(result) {
+    const values = Array.isArray(result.data) ? result.data : [];
+    const audio = await audioToBuffer(values[0]);
+    const note = typeof values[1] === "string" ? values[1] : "";
+    return {
+        audioBase64: audio.buffer.toString("base64"),
+        mime: /\.mp3$/i.test(audio.path) ? "audio/mpeg" : "audio/wav",
+        filename: audio.path.split(/[\\/]/).pop() || "tts.wav",
+        bytes: audio.buffer.length,
+        ms: result.ms,
+        note,
+    };
+}
+
+// ─── 业务 ───────────────────────────────────────────────
+
 async function handleAsr(payload) {
     const { audioBase64, filename, mime } = payload || {};
     if (!audioBase64) throw new Error("缺少 audioBase64");
     const raw = Buffer.from(String(audioBase64), "base64");
     if (!raw.length) throw new Error("音频解码后是空的");
-    const name = String(filename || "audio.wav").replace(/[\\/:*?"<>|]/g, "_");
+    const name = safeName(filename, "audio.wav");
     const blob = new Blob([raw], { type: mime || "audio/wav" });
     const remotePath = await uploadToGradio(blob, name);
     const result = await callGradio(ASR_API, [toFileData(remotePath, name)]);
@@ -151,29 +177,32 @@ async function handleTts(payload) {
     const mode = String(body.mode || "design");
     const text = String(body.text || "").trim();
     if (!text) throw new Error("缺少要朗读的文本");
-    const cfgScale = Number(body.cfgScale ?? 4);
+
+    const cfgScale = Number(body.cfgScale ?? (mode === "clone" ? 1 : 4));
     const speed = Number(body.speed ?? 1);
     const seed = Number(body.seed ?? 42);
 
-    let data;
     if (mode === "clone") {
-        if (!body.refAudioBase64) throw new Error("克隆模式需要 refAudioBase64");
-        const raw = Buffer.from(String(body.refAudioBase64), "base64");
-        const name = String(body.refFilename || "ref.wav").replace(/[\\/:*?"<>|]/g, "_");
-        const remotePath = await uploadToGradio(new Blob([raw], { type: body.refMime || "audio/wav" }), name);
-        data = [text, toFileData(remotePath, name), String(body.refText || ""), cfgScale, speed, seed];
-        const result = await callGradio("do_voice_clone", data);
-        return finishTts(result);
-    }
-    if (mode === "direction") {
-        if (!body.refAudioBase64) throw new Error("情绪模式需要参考音频");
-        const raw = Buffer.from(String(body.refAudioBase64), "base64");
-        const name = String(body.refFilename || "ref.wav").replace(/[\\/:*?"<>|]/g, "_");
-        const remotePath = await uploadToGradio(new Blob([raw], { type: body.refMime || "audio/wav" }), name);
-        const dual = Boolean(body.useDual);
-        data = [
+        if (!body.refAudioBase64) throw new Error("克隆模式需要一段参考音频");
+        const ref = await uploadBase64(body.refAudioBase64, body.refFilename || "ref.wav", body.refMime || "audio/wav");
+        const result = await callGradio("do_voice_clone", [
             text,
-            toFileData(remotePath, name),
+            toFileData(ref.path, ref.name),
+            String(body.refText || ""),
+            cfgScale,
+            speed,
+            seed,
+        ], 1800000);
+        return finishAudio(result);
+    }
+
+    if (mode === "direction") {
+        if (!body.refAudioBase64) throw new Error("情绪模式需要一段参考音频");
+        const ref = await uploadBase64(body.refAudioBase64, body.refFilename || "ref.wav", body.refMime || "audio/wav");
+        const dual = Boolean(body.useDual);
+        const result = await callGradio("do_voice_direction", [
+            text,
+            toFileData(ref.path, ref.name),
             String(body.refText || ""),
             String(body.instruction || ""),
             cfgScale,
@@ -182,27 +211,78 @@ async function handleTts(payload) {
             dual,
             Number(body.cfgRef ?? 4),
             Number(body.cfgIns ?? 4),
-        ];
-        const result = await callGradio("do_voice_direction", data);
-        return finishTts(result);
+        ], 1800000);
+        return finishAudio(result);
     }
-    // 默认：音色设计（只给文字 + 音色描述，不需要参考音频）
-    data = [text, String(body.instruction || ""), cfgScale, speed, seed];
-    const result = await callGradio("do_voice_design", data);
-    return finishTts(result);
+
+    // 默认：音色设计，不需要参考音频
+    const result = await callGradio("do_voice_design", [
+        text,
+        String(body.instruction || ""),
+        cfgScale,
+        speed,
+        seed,
+    ], 1800000);
+    return finishAudio(result);
 }
 
-async function finishTts(result) {
+/** 多角色：脚本解析出角色名，按角色给音色与语速，补满 8 组 */
+async function handleMulti(payload) {
+    const body = payload || {};
+    const script = String(body.script || "").trim();
+    if (!script) throw new Error("缺少配音脚本");
+    const seed = Number(body.seed ?? 42);
+
+    const names = Array.from({ length: 8 }, (_, i) => String(body.roles?.[i] || ""));
+    const voices = Array.from({ length: 8 }, (_, i) => String(body.voices?.[i] || "---下拉选择音色---"));
+    const speeds = Array.from({ length: 8 }, (_, i) => Number(body.speeds?.[i] ?? 1));
+
+    const data = [script, seed, ...names, ...voices, ...speeds];
+    const result = await callGradio("do_multi_role", data, 1800000);
+    return finishAudio(result);
+}
+
+/** SRT 字幕配音：上传 .srt，按时间轴生成整段音频 */
+async function handleSrt(payload) {
+    const body = payload || {};
+    if (!body.srtBase64) throw new Error("缺少 SRT 文件内容");
+    const srt = await uploadBase64(body.srtBase64, body.srtName || "subtitle.srt", "text/plain");
+    const voice = String(body.voice || "---下拉选择音色---");
+    const seed = Number(body.seed ?? 42);
+    const result = await callGradio("do_srt", [toFileData(srt.path, srt.name), voice, seed], 1800000);
+    return finishAudio(result);
+}
+
+async function handleVoices() {
+    const result = await callGradio("lambda_32", [], 30000);
+    const value = Array.isArray(result.data) ? result.data[0] : null;
+    const choices = value?.choices || [];
+    const names = choices
+        .map((c) => (Array.isArray(c) ? c[1] : c))
+        .filter((n) => typeof n === "string" && n && !n.startsWith("---"));
+    return { voices: names };
+}
+
+/** 取某个内置音色（voices 目录）的参考音频与参考文本 */
+async function handleVoice(name) {
+    if (!name) throw new Error("缺少音色名");
+    const result = await callGradio("load_voice", [String(name)], 180000);
     const values = Array.isArray(result.data) ? result.data : [];
     const audio = await audioToBuffer(values[0]);
-    const note = typeof values[1] === "string" ? values[1] : "";
     return {
         audioBase64: audio.buffer.toString("base64"),
         mime: /\.mp3$/i.test(audio.path) ? "audio/mpeg" : "audio/wav",
-        bytes: audio.buffer.length,
+        text: typeof values[1] === "string" ? values[1] : "",
         ms: result.ms,
-        note,
     };
+}
+
+/** 低显存模式开关：对之后所有页签生效 */
+async function handleOffload(payload) {
+    const enabled = Boolean(payload?.enabled);
+    const result = await callGradio("on_toggle_offload", [enabled], 60000);
+    const note = Array.isArray(result.data) ? String(result.data[0] || "") : "";
+    return { enabled, note, ms: result.ms };
 }
 
 async function checkGradio() {
@@ -211,12 +291,21 @@ async function checkGradio() {
         if (!response.ok) return { ok: false, error: `HTTP ${response.status}` };
         const info = await response.json();
         const endpoints = Object.keys(info.named_endpoints || {});
-        const hasAsr = endpoints.some((n) => n.includes(ASR_API));
-        return { ok: true, endpoints: endpoints.length, asr: hasAsr, base: GRADIO };
+        return { ok: true, endpoints: endpoints.length, asr: endpoints.some((n) => n.includes(ASR_API)), base: GRADIO };
     } catch (error) {
         return { ok: false, error: String(error?.message || error), base: GRADIO };
     }
 }
+
+const ROUTES = {
+    post: {
+        "/asr": handleAsr,
+        "/tts": handleTts,
+        "/multi": handleMulti,
+        "/srt": handleSrt,
+        "/offload": handleOffload,
+    },
+};
 
 const server = http.createServer(async (req, res) => {
     if (req.method === "OPTIONS") {
@@ -234,7 +323,16 @@ const server = http.createServer(async (req, res) => {
             json(res, 200, { ok: true, bridge: true, port: PORT, gradio, asrApi: ASR_API });
             return;
         }
-        if (req.method === "POST" && (route === "/asr" || route === "/tts")) {
+        if (req.method === "GET" && route === "/voices") {
+            json(res, 200, { ok: true, ...(await handleVoices()) });
+            return;
+        }
+        if (req.method === "GET" && route === "/voice") {
+            json(res, 200, { ok: true, ...(await handleVoice(url.searchParams.get("name") || "")) });
+            return;
+        }
+        const handler = req.method === "POST" ? ROUTES.post[route] : null;
+        if (handler) {
             const raw = await readBody(req);
             let payload = {};
             try {
@@ -243,8 +341,7 @@ const server = http.createServer(async (req, res) => {
                 json(res, 400, { ok: false, error: "请求体不是合法 JSON" });
                 return;
             }
-            const result = route === "/asr" ? await handleAsr(payload) : await handleTts(payload);
-            json(res, 200, { ok: true, ...result });
+            json(res, 200, { ok: true, ...(await handler(payload)) });
             return;
         }
         json(res, 404, { ok: false, error: "没有这个接口：" + route });
